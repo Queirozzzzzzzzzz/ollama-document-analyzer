@@ -26,7 +26,7 @@ JSON_REQUIREMENTS = [
     { "item": "Formação Acadêmica", "status": "", "detalhes": "" },
     { "item": "Experiência Profissional", "status": "", "detalhes": "" }
 ]
-MODELS = ["llama3.1:8b", "deepseek-r1:8b", ""]
+MODELS = ["llama3.1:8b", "deepseek-r1:8b", "gpt-oss:20b", "gemma3:12b", ""]
 
 # --- Core Resume Processing Functions ------------------------------------------------
 
@@ -87,7 +87,7 @@ def ollama_chat(model, prompt):
     """
     try:
         result = subprocess.run(
-            ["ollama", "run", model],
+            ["ollama", "run", model, "--think=false"],
             input=prompt.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
