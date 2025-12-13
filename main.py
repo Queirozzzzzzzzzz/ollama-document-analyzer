@@ -31,25 +31,23 @@ JSON_REQUIREMENTS = [
 ]
 TEXT_MODELS = ["llama3.1:8b", "deepseek-r1:8b", "gpt-oss:20b", "gemma3:12b"]
 IMAGE_MODELS = ["deepseek-ocr", "moondream2", "qwen3-vl", "PaddleOCR-vl"]
+IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
 
 
 # --- Core Resume Processing Functions ------------------------------------------------
 
 
 def extract_text_from_file(path):
-    # Detecta tipo de arquivo
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".docx":
         return extract_text_from_docx(path)
     elif ext == ".pdf":
         return extract_text_from_pdf(path)
-
+    elif ext in IMAGE_EXTENSIONS:
+        return ""
     else:
-        return {
-            "error": f"Formato não suportado: {ext}",
-            "file": os.path.basename(path),
-        }
+        return ""
 
 
 def extract_text_from_docx(path):
@@ -63,6 +61,59 @@ def extract_text_from_pdf(path):
         for page in pdf:
             text.append(page.get_text())
     return "\n".join(text)
+
+
+def extract_images_from_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    img_dir = os.path.join("tmp_images", os.path.basename(path))
+
+    if ext in IMAGE_EXTENSIONS:
+        return [path]
+
+    if ext == ".docx":
+        return extract_images_from_docx(path, img_dir)
+
+    if ext == ".pdf":
+        return extract_images_from_pdf(path, img_dir)
+
+    return []
+
+
+def extract_images_from_docx(path, out_dir):
+    doc = docx.Document(path)
+    images = []
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    for rel in doc.part._rels.values():
+        if "image" in rel.target_ref:
+            image = rel.target_part.blob
+            img_name = os.path.basename(rel.target_ref)
+            img_path = os.path.join(out_dir, img_name)
+            with open(img_path, "wb") as f:
+                f.write(image)
+            images.append(img_path)
+
+    return images
+
+
+def extract_images_from_pdf(path, out_dir):
+    images = []
+    os.makedirs(out_dir, exist_ok=True)
+
+    with pymupdf.open(path) as pdf:
+        for page_index, page in enumerate(pdf):
+            for img_index, img in enumerate(page.get_images(full=True)):
+                xref = img[0]
+                base = pdf.extract_image(xref)
+                img_bytes = base["image"]
+                ext = base["ext"]
+                img_path = os.path.join(out_dir, f"page{page_index}_{img_index}.{ext}")
+                with open(img_path, "wb") as f:
+                    f.write(img_bytes)
+                images.append(img_path)
+
+    return images
 
 
 def build_prompt(text, requirements):
@@ -115,6 +166,25 @@ def ollama_chat(model, prompt):
         return "[ERROR] ollama run timed out."
     except Exception as e:
         return f"[ERROR] ollama run failed: {e}"
+
+
+def ollama_image_analyze(model, image_path):
+    prompt = (
+        f"Analise a imagem sobre a perspectiva de {DOCUMENT_TYPE}. "
+        "Extraia qualquer texto visível (OCR) e descreva o conteúdo visual."
+    )
+
+    try:
+        result = subprocess.run(
+            ["ollama", "run", model, image_path],
+            input=prompt.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+        return result.stdout.decode("utf-8", errors="ignore")
+    except Exception as e:
+        return f"[ERROR image analysis] {e}"
 
 
 def extract_json(text):
@@ -198,13 +268,25 @@ def safe_json_loads(s):
             raise ValueError(f"JSON inválido: {e}")
 
 
-def validate_resume_local(path, model="llama3.1:8b"):
+def validate_resume_local(path, text_model, image_model=None):
+    text_content = extract_text_from_file(path)
+
+    image_analysis_text = ""
+    if image_model:
+        images = extract_images_from_file(path)
+        for img in images:
+            image_analysis_text += f"\n[Imagem: {os.path.basename(img)}]\n"
+            image_analysis_text += ollama_image_analyze(image_model, img) + "\n"
+
+    full_text = f"""
+        {text_content}
+
+        [CONTEÚDO EXTRAÍDO VIA OCR DE IMAGEM]
+        {image_analysis_text}
     """
-    Synchronous function that runs the whole pipeline and returns a dict result.
-    """
-    text = extract_text_from_file(path)
-    prompt = build_prompt(text, REQUIREMENTS)
-    response = ollama_chat(model, prompt)
+
+    prompt = build_prompt(full_text, REQUIREMENTS)
+    response = ollama_chat(text_model, prompt)
     json_str = extract_json(response)
 
     if not json_str:
@@ -223,9 +305,11 @@ def validate_resume_local(path, model="llama3.1:8b"):
         "file": os.path.basename(path),
         "path": os.path.abspath(path),
         "timestamp": datetime.now().isoformat(),
-        "model": model,
+        "text_model": text_model,
+        "image_model": image_model,
         "result": data,
     }
+
     save_result_entry(entry)
     return entry
 
@@ -261,12 +345,9 @@ def export_entry_to_pdf(entry, outpath):
 # --- Threaded Worker -----------------------------------------------------------------
 
 
-def worker_analyze(path, model, result_queue):
-    """
-    Worker that runs validate_resume_local and puts entry into result_queue.
-    """
+def worker_analyze(path, text_model, image_model, result_queue):
     try:
-        entry = validate_resume_local(path, model)
+        entry = validate_resume_local(path, text_model, image_model)
         result_queue.put(("ok", entry))
     except Exception as e:
         result_queue.put(("error", str(e)))
@@ -508,11 +589,10 @@ class ResumeAnalyzerApp:
     # File selection and analysis -----------------------------------------------
     def select_file(self):
         path = filedialog.askopenfilename(
-            title="Selecione o arquivo (.docx, .pdf)",
+            title="Selecione o arquivo",
             filetypes=[
-                ("Documentos", "*.docx;*.pdf"),
-                ("Word", "*.docx"),
-                ("PDF", "*.pdf"),
+                ("Documentos", "*.docx;*.pdf;*.png;*.jpg;*.jpeg;*.webp"),
+                ("Imagens", "*.png;*.jpg;*.jpeg;*.webp"),
             ],
         )
         if not path:
@@ -564,10 +644,14 @@ class ResumeAnalyzerApp:
         self.run_analysis(path)
 
     def run_analysis(self, path):
-        text_model = self.text_model_var.get().strip() or "llama3.1:8b"
+        text_model = self.text_model_var.get().strip() or TEXT_MODELS[0]
+        image_model = self.image_model_var.get().strip() or IMAGE_MODELS[0]
+
         # start progress and thread
         self.progress.start(10)
-        self.status_var.set(f"Analisando {os.path.basename(path)} com {text_model} ...")
+        self.status_var.set(
+            f"Analisando {os.path.basename(path)} com {text_model} e {image_model} ..."
+        )
         self.btn_select.config(state=tk.DISABLED)
         self.delete_button.config(state=tk.DISABLED)
         self.btn_rerun.config(state=tk.DISABLED)
@@ -575,7 +659,9 @@ class ResumeAnalyzerApp:
         self.btn_clear.config(state=tk.DISABLED)
 
         t = threading.Thread(
-            target=worker_analyze, args=(path, text_model, self.queue), daemon=True
+            target=worker_analyze,
+            args=(path, text_model, image_model, self.queue),
+            daemon=True,
         )
         t.start()
 
