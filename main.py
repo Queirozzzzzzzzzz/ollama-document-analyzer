@@ -13,6 +13,8 @@ import ast
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+import base64
+
 
 APP_TITLE = "Validador de Currículos"
 RESULTS_FILE = "results.json"
@@ -168,21 +170,40 @@ def ollama_chat(model, prompt):
         return f"[ERROR] ollama run failed: {e}"
 
 
-def ollama_image_analyze(model, image_path):
-    prompt = (
-        f"Analise a imagem sobre a perspectiva de {DOCUMENT_TYPE}. "
-        "Extraia qualquer texto visível (OCR) e descreva o conteúdo visual."
-    )
+def image_to_base64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
+
+def ollama_image_analyze(model, image_path):
     try:
+        img_b64 = image_to_base64(image_path)
+
+        prompt = f"""
+Analise a imagem abaixo como um {DOCUMENT_TYPE}.
+Extraia TODO texto visível (OCR) e descreva o conteúdo visual.
+
+[IMAGEM_BASE64]
+{img_b64}
+"""
+
         result = subprocess.run(
-            ["ollama", "run", model, image_path],
+            ["ollama", "run", model, "--think=false"],
             input=prompt.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=300,
+            timeout=120,
         )
+
+        if result.returncode != 0:
+            return "[ERROR image analysis]\n" + result.stderr.decode(
+                "utf-8", errors="ignore"
+            )
+
         return result.stdout.decode("utf-8", errors="ignore")
+
+    except subprocess.TimeoutExpired:
+        return "[ERROR image analysis] OCR timeout"
     except Exception as e:
         return f"[ERROR image analysis] {e}"
 
@@ -307,6 +328,8 @@ def validate_resume_local(path, text_model, image_model=None):
         "timestamp": datetime.now().isoformat(),
         "text_model": text_model,
         "image_model": image_model,
+        "prompt": prompt,
+        "raw_response": response,
         "result": data,
     }
 
@@ -457,12 +480,27 @@ class ResumeAnalyzerApp:
         )
         self.meta_label.pack(fill=tk.X, padx=2, pady=2)
 
+        self.tabs = ttk.Notebook(right)
+        self.tabs.pack(fill=tk.BOTH, expand=True)
+
+        # --- Result tab
+        result_frame = ttk.Frame(self.tabs)
         self.result_text = scrolledtext.ScrolledText(
-            right, font=("Consolas", 11), wrap=tk.WORD
+            result_frame, font=("Consolas", 11), wrap=tk.WORD
         )
+        self.result_text.pack(fill=tk.BOTH, expand=True)
+        self.tabs.add(result_frame, text="Resultado")
+
+        # --- Prompt tab
+        prompt_frame = ttk.Frame(self.tabs)
+        self.prompt_text = scrolledtext.ScrolledText(
+            prompt_frame, font=("Consolas", 10), wrap=tk.WORD
+        )
+        self.prompt_text.pack(fill=tk.BOTH, expand=True)
+        self.tabs.add(prompt_frame, text="Prompt")
+
         self.result_text.tag_configure("title", font=("Consolas", 14, "bold"))
         self.result_text.tag_configure("bold", font=("Consolas", 11, "bold"))
-        self.result_text.pack(fill=tk.BOTH, expand=True)
 
         # Last row: status
         self.status_var = tk.StringVar(value="Pronto")
@@ -546,6 +584,14 @@ class ResumeAnalyzerApp:
 
         result = entry.get("result", {})
         self.result_text.delete(1.0, tk.END)
+
+        # --- Prompt tab content
+        self.prompt_text.delete(1.0, tk.END)
+        prompt = entry.get("prompt", "")
+        if prompt:
+            self.prompt_text.insert(tk.END, prompt)
+        else:
+            self.prompt_text.insert(tk.END, "[Prompt não disponível]")
 
         if "error" in result:
             self.result_text.insert(
